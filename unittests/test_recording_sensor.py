@@ -9,8 +9,6 @@ import zoneinfo
 
 import pytest
 
-from homeassistant.const import STATE_UNAVAILABLE
-
 # Ensure custom_components is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -99,8 +97,8 @@ class TestAsyncOldGatherUpdate:
         assert sensor._state == 4.2
 
     @pytest.mark.asyncio
-    async def test_stale_data_returns_unavailable(self):
-        """When latest data is >6h old, return STATE_UNAVAILABLE."""
+    async def test_stale_data_returns_none(self):
+        """When latest data is >6h old, state is None (unknown)."""
         sensor = _make_sensor()
         # Current time: 22:06, but gateway only has data until 14:00 (8h lag)
         now = datetime(2026, 3, 1, 22, 6, 0, tzinfo=TZ_BERLIN)
@@ -119,7 +117,7 @@ class TestAsyncOldGatherUpdate:
             mock_dt.now.return_value = now
             await sensor.async_old_gather_update()
 
-        assert sensor._state == STATE_UNAVAILABLE
+        assert sensor._state is None
 
     @pytest.mark.asyncio
     async def test_no_data_returns_early(self):
@@ -175,8 +173,8 @@ class TestAsyncOldGatherUpdate:
         assert sensor._state == 9.9
 
     @pytest.mark.asyncio
-    async def test_fallback_just_over_6h(self):
-        """Fallback at 6h + 1 second should be rejected."""
+    async def test_fallback_just_over_6h_returns_none(self):
+        """Fallback at 6h + 1 second should be rejected, state is None."""
         sensor = _make_sensor()
         now = datetime(2026, 3, 1, 20, 6, 1, tzinfo=TZ_BERLIN)
         # Data from exactly 6h + 1s ago
@@ -195,7 +193,7 @@ class TestAsyncOldGatherUpdate:
             mock_dt.now.return_value = now
             await sensor.async_old_gather_update()
 
-        assert sensor._state == STATE_UNAVAILABLE
+        assert sensor._state is None
 
     @pytest.mark.asyncio
     async def test_stale_data_logs_warning(self, caplog):

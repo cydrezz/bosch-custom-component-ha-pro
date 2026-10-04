@@ -36,6 +36,10 @@ from .base import BoschBaseSensor
 
 _LOGGER = logging.getLogger(__name__)
 
+# How far back to look for the baseline row when the regular query window
+# holds none: one month first (cheap), then everything there could be.
+BASELINE_LOOKBACKS = (timedelta(days=30), timedelta(days=3660))
+
 
 class StatisticsQueryError(Exception):
     """Recorder DB query failed - callers must abort the statistics cycle.
@@ -162,22 +166,53 @@ class StatisticHelper(BoschBaseSensor):
 
     def get_last_stats_before_date(
         self, last_stats: dict[str, list[StatisticsRow]], day: datetime
-    ):
+    ) -> StatisticsRow | None:
+        """Return the newest row strictly before day, or None."""
         day_stamp = datetime_to_timestamp_or_none(day)
         closest_stat = None
-        for stat in last_stats[self.statistic_id]:
+        for stat in last_stats.get(self.statistic_id, []):
             tstmp = stat.get("start")
             if tstmp < day_stamp and (
                 closest_stat is None or tstmp > closest_stat.get("start")
             ):
                 closest_stat = stat
-        if not closest_stat:
-            closest_stat = last_stats[self.statistic_id][-1]
-            _LOGGER.debug("Closest stat not found, use last one from array!")
         _LOGGER.debug(
-            "Last stat for %s found %s", self.statistic_id, closest_stat
+            "Last stat for %s before %s found %s",
+            self.statistic_id,
+            day,
+            closest_stat,
         )
         return closest_stat
+
+    async def async_get_last_stats_before_date(
+        self, last_stats: dict[str, list[StatisticsRow]], day: datetime
+    ) -> StatisticsRow | None:
+        """Return the baseline row (newest row before day) for a re-import.
+
+        The caller's query window can miss it: days on which the gateway
+        reported 0 kWh get no rows at all (zero values are skipped). The
+        former fallback then took the NEWEST row of the window - a row of
+        the day being rebuilt - as baseline, so every hourly run added that
+        day's running total again (phantom kWh). Search further back in
+        the recorder instead; with no row at all start from 0 like the
+        initial import.
+        """
+        closest_stat = self.get_last_stats_before_date(last_stats, day)
+        if closest_stat is not None:
+            return closest_stat
+        for lookback in BASELINE_LOOKBACKS:
+            older_stats = await self.get_stats_from_ha_db(
+                start_time=day - lookback, end_time=day
+            )
+            closest_stat = self.get_last_stats_before_date(older_stats, day)
+            if closest_stat is not None:
+                return closest_stat
+        _LOGGER.debug(
+            "No statistic row of %s before %s - starting from sum 0.",
+            self.statistic_id,
+            day,
+        )
+        return None
 
     async def insert_statistics_range(self, start_time: datetime) -> None:
         """Attempt to put past data into database."""

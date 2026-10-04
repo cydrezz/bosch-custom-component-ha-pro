@@ -290,9 +290,9 @@ class RecordingSensor(StatisticHelper):
         all_stats = []
 
         async def get_last_stats_from_bosch_api():
-            last_stats_row = self.get_last_stats_before_date(
+            last_stats_row = await self.async_get_last_stats_before_date(
                 last_stats=last_stats, day=start_of_day
-            )
+            ) or {}
             start_time = last_stats_row.get("start")
             _sum = last_stats_row.get("sum", 0)
             if isinstance(start_time, float):
@@ -331,9 +331,9 @@ class RecordingSensor(StatisticHelper):
                 # let's get last state once again
                 # as bosch state provide whole day always.
                 first_date_from_state = self._bosch_object.state[0]
-                last_stats_row = self.get_last_stats_before_date(
+                last_stats_row = await self.async_get_last_stats_before_date(
                     last_stats=last_stats, day=first_date_from_state["d"]
-                )
+                ) or {}
                 _sum = last_stats_row.get("sum", 0)
             return self._bosch_object.state, _sum
 

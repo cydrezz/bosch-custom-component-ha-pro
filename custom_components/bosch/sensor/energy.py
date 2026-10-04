@@ -284,11 +284,11 @@ class EnergySensor(StatisticHelper):
             last_stats = last_stat
 
         async def get_last_stats_from_bosch_api():
-            last_stats_row = self.get_last_stats_before_date(
+            last_stats_row = await self.async_get_last_stats_before_date(
                 last_stats=last_stats, day=start_of_yesterday_utc
-            )
-            start_time = last_stats_row["start"]
-            _sum = last_stats_row["sum"] or 0
+            ) or {}
+            start_time = last_stats_row.get("start")
+            _sum = last_stats_row.get("sum") or 0
             if isinstance(start_time, float):
                 start_time = timestamp_to_datetime_or_none(start_time)
             if not start_time:

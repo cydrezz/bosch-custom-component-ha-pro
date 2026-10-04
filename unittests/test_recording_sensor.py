@@ -339,3 +339,108 @@ class TestInsertStatisticsElseBranch:
 
         sensor.fetch_past_data.assert_called_once()
         sensor.append_statistics.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Baseline row after a day without statistic rows (0 kWh day = no rows)
+# ---------------------------------------------------------------------------
+
+
+class TestBaselineAfterGapDay:
+    """The baseline must be the newest row BEFORE the day, never a row of it."""
+
+    @staticmethod
+    def _row(dt, state, _sum):
+        return {"start": dt.timestamp(), "state": state, "sum": _sum}
+
+    @pytest.mark.asyncio
+    async def test_found_in_window_needs_no_extra_query(self):
+        sensor = _make_sensor(new_stats_api=True)
+        day = datetime(2026, 9, 9, 0, 0, 0, tzinfo=TZ_BERLIN)
+        before = self._row(day - timedelta(hours=1), 1.0, 100.0)
+        today = self._row(day + timedelta(hours=7), 1.0, 101.0)
+        sensor.get_stats_from_ha_db = AsyncMock()
+
+        row = await sensor.async_get_last_stats_before_date(
+            {sensor.statistic_id: [before, today]}, day
+        )
+
+        assert row is before
+        sensor.get_stats_from_ha_db.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gap_day_searches_further_back(self):
+        """Window holds only rows of the day itself -> query older rows."""
+        sensor = _make_sensor(new_stats_api=True)
+        day = datetime(2026, 9, 9, 0, 0, 0, tzinfo=TZ_BERLIN)
+        today = self._row(day + timedelta(hours=7), 1.0, 109.0)
+        older = self._row(day - timedelta(days=2, hours=3), 0.5, 108.0)
+        sensor.get_stats_from_ha_db = AsyncMock(
+            return_value={sensor.statistic_id: [older]}
+        )
+
+        row = await sensor.async_get_last_stats_before_date(
+            {sensor.statistic_id: [today]}, day
+        )
+
+        assert row is older  # old code returned `today` -> phantom kWh
+        kwargs = sensor.get_stats_from_ha_db.call_args.kwargs
+        assert kwargs["end_time"] == day
+        assert kwargs["start_time"] == day - timedelta(days=30)
+
+    @pytest.mark.asyncio
+    async def test_no_row_before_day_starts_from_zero(self):
+        sensor = _make_sensor(new_stats_api=True)
+        day = datetime(2026, 9, 9, 0, 0, 0, tzinfo=TZ_BERLIN)
+        today = self._row(day + timedelta(hours=7), 1.0, 1.0)
+        sensor.get_stats_from_ha_db = AsyncMock(return_value={})
+
+        row = await sensor.async_get_last_stats_before_date(
+            {sensor.statistic_id: [today]}, day
+        )
+
+        assert row is None
+        assert sensor.get_stats_from_ha_db.call_count == 2  # 30 d, then all
+
+    @pytest.mark.asyncio
+    async def test_insert_statistics_uses_row_before_gap_day(self):
+        """Hourly run on the day after a 0 kWh day keeps the old sum as base."""
+        import asyncio
+
+        sensor = _make_sensor(new_stats_api=True)
+        sensor._statistic_import_lock = asyncio.Lock()
+        stat_id = sensor.statistic_id
+        now = datetime(2026, 9, 9, 14, 6, 0, tzinfo=TZ_BERLIN)
+        start_of_day = now.replace(hour=0, minute=0)
+        today = self._row(start_of_day + timedelta(hours=7), 1.0, 109.0)
+        before_gap = self._row(start_of_day - timedelta(hours=27), 0.5, 108.0)
+
+        async def stats_from_db(start_time, end_time):
+            rows = [
+                r
+                for r in (before_gap, today)
+                if start_time.timestamp() <= r["start"] < end_time.timestamp()
+            ]
+            return {stat_id: rows} if rows else {}
+
+        sensor.get_last_stat = AsyncMock(return_value={stat_id: [today]})
+        sensor.get_stats_from_ha_db = AsyncMock(side_effect=stats_from_db)
+        sensor.append_statistics = MagicMock(return_value=109.0)
+        sensor._bosch_object.state = [
+            {"d": start_of_day + timedelta(hours=7), "value": 1.0}
+        ]
+        # base row is older than yesterday -> catch-up fetch from the gateway
+        sensor.fetch_past_data = AsyncMock(
+            return_value={0: {"d": start_of_day + timedelta(hours=7), "value": 1.0}}
+        )
+
+        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.start_of_local_day.side_effect = lambda d=None: (
+                (d or now).replace(hour=0, minute=0, second=0, microsecond=0)
+            )
+            await sensor._insert_statistics()
+
+        # old code took the newest row (109.0, a row of today) as base
+        sensor.append_statistics.assert_called_once()
+        assert sensor.append_statistics.call_args.kwargs["sum"] == 108.0

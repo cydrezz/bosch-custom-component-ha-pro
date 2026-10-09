@@ -10,7 +10,15 @@ from bosch_thermostat_client.const import (
 from bosch_thermostat_client.const.easycontrol import ENERGY
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from ..const import CIRCUITS, DOMAIN, GATEWAY, SIGNAL_BOSCH, UUID
+from ..const import (
+    CIRCUITS,
+    CONF_ENERGY_COUNTER_UNIT,
+    DEFAULT_ENERGY_COUNTER_UNIT,
+    DOMAIN,
+    GATEWAY,
+    SIGNAL_BOSCH,
+    UUID,
+)
 from .bosch import BoschSensor
 from .circuit import CircuitSensor
 from .energy import EcusRecordingSensors, EnergySensor, EnergySensors
@@ -40,19 +48,21 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     enabled_sensors = config_entry.data.get(SENSORS, [])
 
     new_stats_api = config_entry.options.get("new_stats_api", False)
+    energy_counter_unit = config_entry.options.get(
+        CONF_ENERGY_COUNTER_UNIT, DEFAULT_ENERGY_COUNTER_UNIT
+    )
     gateway = data[GATEWAY]
     data[SENSOR] = []
     data[RECORDING] = []
 
     def get_sensors(sensor):
         if sensor.kind in (RECORDING, REGULAR, "notification"):
-            kwargs = (
-                {
-                    "new_stats_api": new_stats_api,
-                }
-                if sensor.kind == RECORDING
-                else {}
-            )
+            if sensor.kind == RECORDING:
+                kwargs = {"new_stats_api": new_stats_api}
+            elif sensor.kind == REGULAR:
+                kwargs = {"energy_counter_unit": energy_counter_unit}
+            else:
+                kwargs = {}
             return (
                 SensorKinds[sensor.kind],
                 [

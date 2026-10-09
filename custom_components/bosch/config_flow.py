@@ -24,8 +24,11 @@ from .const import (
     ACCESS_KEY,
     ACCESS_TOKEN,
     CONF_DEVICE_TYPE,
+    CONF_ENERGY_COUNTER_UNIT,
     CONF_PROTOCOL,
+    DEFAULT_ENERGY_COUNTER_UNIT,
     DOMAIN,
+    ENERGY_COUNTER_UNITS,
     UUID,
 )
 
@@ -216,6 +219,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
         new_stats_api = self.entry.options.get("new_stats_api", False)
         optimistic_mode = self.entry.options.get("optimistic_mode", False)
+        energy_counter_unit = self.entry.options.get(
+            CONF_ENERGY_COUNTER_UNIT, DEFAULT_ENERGY_COUNTER_UNIT
+        )
 
         return self.async_show_form(
             step_id="init",
@@ -223,6 +229,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 {
                     vol.Optional("new_stats_api", default=new_stats_api): bool,
                     vol.Optional("optimistic_mode", default=optimistic_mode): bool,
+                    vol.Optional(
+                        CONF_ENERGY_COUNTER_UNIT, default=energy_counter_unit
+                    ): vol.In(list(ENERGY_COUNTER_UNITS)),
                 }
             ),
         )

@@ -15,6 +15,15 @@ UUID = "uuid"
 CONF_PROTOCOL = "http_xmpp"
 CONF_DEVICE_TYPE = "device_type"
 
+# ha-pro: raw unit of /heatSources/energyMonitoring/consumption. The gateway
+# labels it "kWh" on every device, but the real scale differs per appliance
+# (kWh on KM100/KM200 boilers, J on a WLW196-11 heat pump via nsc_icom_gateway,
+# Wh reported for a CW400; maxValue is 135780000 on all of them, so it cannot be
+# detected). Values are divisors to kWh; "kWh" keeps the upstream behaviour.
+CONF_ENERGY_COUNTER_UNIT = "energy_counter_unit"
+ENERGY_COUNTER_UNITS = {"kWh": 1, "Wh": 1_000, "kJ": 3_600, "J": 3_600_000}
+DEFAULT_ENERGY_COUNTER_UNIT = "kWh"
+
 GATEWAY = "gateway"
 CLIMATE = "climate"
 # SENSOR = "sensor"

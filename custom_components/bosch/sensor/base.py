@@ -11,11 +11,27 @@ from homeassistant.const import EntityCategory
 from homeassistant.util import dt as dt_util
 
 from ..bosch_entity import BoschEntity
-from ..const import UNITS_CONVERTER
+from ..const import (
+    DEFAULT_ENERGY_COUNTER_UNIT,
+    ENERGY_COUNTER_UNITS,
+    UNITS_CONVERTER,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 entity_categories = {"diagnostic": EntityCategory.DIAGNOSTIC}
+
+# Raw energy counter above this is implausible as kWh (a house would need
+# 1 GWh); used only for a one-time log hint pointing to the option.
+ENERGY_COUNTER_KWH_HINT = 1_000_000
+
+
+def convert_energy_counter(value, divisor):
+    """Scale the raw energy counter to kWh; non-numeric values pass through."""
+    try:
+        return round(float(value) / divisor, 3)
+    except (TypeError, ValueError):
+        return value
 
 
 class BoschBaseSensor(BoschEntity, SensorEntity):
@@ -32,8 +48,11 @@ class BoschBaseSensor(BoschEntity, SensorEntity):
         domain_name=None,
         circuit_type=None,
         is_enabled=False,
+        energy_counter_unit=DEFAULT_ENERGY_COUNTER_UNIT,
     ):
         """Initialize the sensor."""
+        self._energy_divisor = ENERGY_COUNTER_UNITS.get(energy_counter_unit, 1)
+        self._energy_unit_hinted = False
         super().__init__(
             hass=hass,
             uuid=uuid,
@@ -123,19 +142,33 @@ class BoschBaseSensor(BoschEntity, SensorEntity):
             else:
                 self._state = _state
                 if self._attr_uri == "energyConsumption":
-                    # ha-pro: raw value is J, not kJ - measured 2026-07-25..29
-                    # on ONE WLW196-11 via nsc_icom_gateway after a counter
-                    # reset: the counter grew a constant ~7.3 units/s even
-                    # with the compressor idle (7.3 W standby electronics;
-                    # kJ would mean 7.3 kW continuous draw) and missed ~4 kWh
-                    # of real compressor consumption entirely (counter
-                    # +2.53 MJ vs 14.4 MJ actual). Note the counter therefore
-                    # tracks controller standby, not total consumption.
-                    # The /3600 ("kJ") divisor was this fork's own earlier
-                    # guess (upstream does no conversion); it overstated
-                    # the value by x1000. Other device families with this
-                    # URI are unverified - measure before generalizing.
-                    self._state = round(float(self._state) / 3_600_000, 3)
+                    # ha-pro: the gateway labels this counter "kWh" on every
+                    # device, but the real scale is per appliance (see
+                    # ENERGY_COUNTER_UNITS). A WLW196-11 heat pump via
+                    # nsc_icom_gateway delivers J (measured 2026-07-25..29:
+                    # +7.3 units/s with the compressor idle = 7.3 W standby;
+                    # the counter tracks controller standby, not total
+                    # consumption), a GB192i via KM100 delivers kWh. So the
+                    # unit is a per-gateway option; default "kWh" = upstream.
+                    self._state = convert_energy_counter(
+                        self._state, self._energy_divisor
+                    )
+                    if (
+                        self._energy_divisor == 1
+                        and not self._energy_unit_hinted
+                        and isinstance(self._state, float)
+                        and self._state > ENERGY_COUNTER_KWH_HINT
+                    ):
+                        self._energy_unit_hinted = True
+                        _LOGGER.warning(
+                            "%s reports %s labelled kWh, which is implausible. "
+                            "Compare with your Bosch/Buderus app and set "
+                            "'Raw unit of the energy counter' in the Bosch "
+                            "integration options (about 1000x too high = Wh, "
+                            "3600x = kJ, millions = J).",
+                            self._name,
+                            self._state,
+                        )
                 if self._attr_uri in ("systemUptime", "totalSystem"):
                     try:
                         self._state = str(timedelta(seconds=int(self._state)))

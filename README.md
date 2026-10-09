@@ -93,3 +93,16 @@ Download `json` file and attach it somewhere. The `json` file is stored under <h
 # First config help needed.
 
 Come to Discord channel https://discord.gg/WeWQGNR and let's try to figure out if you have unknown device for us or if there is issue with component.
+
+## ha-pro option: raw unit of the energy counter
+
+`/heatSources/energyMonitoring/consumption` is labelled "kWh" by every gateway,
+but the real scale differs per appliance (kWh on KM100/KM200 boilers, J on a
+WLW196-11 heat pump behind an nsc_icom gateway, Wh reported for a CW400).
+Since it cannot be detected, it is an option per gateway
+(Settings -> Integrations -> Bosch -> Configure): kWh (default: raw value,
+rounded to 3 decimals, otherwise as upstream), Wh, kJ or J. Fork releases
+0.28.8.3 to 0.28.8.5 divided by 3.6 million for everyone; since 0.28.8.6
+WLW196/nsc_icom users set the option to J once. Compare `sensor.energy_consumption` with your app:
+about 1000x too high = Wh, 3600x = kJ, millions of times = J. A log warning
+appears once when the raw value is implausible for kWh.

@@ -46,7 +46,8 @@
         "title": "Bosch options",
         "data": {
           "new_stats_api": "Use new statistic API",
-          "optimistic_mode": "Use optimistic mode for some functions (currently Easycontrol Operation mode set)."
+          "optimistic_mode": "Use optimistic mode for some functions (currently Easycontrol Operation mode set).",
+          "energy_counter_unit": "Raw unit of the energy counter (/heatSources/energyMonitoring/consumption). Compare with your Bosch/Buderus app: value about 1000x too high = Wh, 3600x = kJ, millions of times = J (WLW196 heat pump). Default kWh = raw value (upstream behaviour); WLW196/nsc_icom users choose J."
         }
       }
     }

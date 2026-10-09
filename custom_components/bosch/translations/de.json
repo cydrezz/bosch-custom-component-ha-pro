@@ -46,7 +46,8 @@
         "title": "Bosch Optionen",
         "data": {
           "new_stats_api": "Neue Statistik-API verwenden",
-          "optimistic_mode": "Optimistischen Modus verwenden (aktuell für CT200 Betriebsart)."
+          "optimistic_mode": "Optimistischen Modus verwenden (aktuell für CT200 Betriebsart).",
+          "energy_counter_unit": "Rohdaten-Einheit des Energiezaehlers (/heatSources/energyMonitoring/consumption). Mit der Bosch/Buderus-App vergleichen: Wert etwa 1000-mal zu hoch = Wh, 3600-mal = kJ, millionenfach = J (WLW196-Waermepumpe). Standard kWh = Rohwert (Upstream-Verhalten); WLW196/nsc_icom-Nutzer waehlen J."
         }
       }
     }

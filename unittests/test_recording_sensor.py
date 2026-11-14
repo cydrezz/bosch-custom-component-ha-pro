@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
 import logging
 import sys
 import os
@@ -263,6 +264,7 @@ class TestInsertStatisticsElseBranch:
         sensor.get_last_stats_before_date = MagicMock(
             return_value={"start": recent_ts, "sum": 100.0}
         )
+        # yesterday was already re-fetched today -> plain hourly run
 
         with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
             mock_dt.now.return_value = now
@@ -303,6 +305,7 @@ class TestInsertStatisticsElseBranch:
         sensor.get_last_stats_before_date = MagicMock(
             return_value={"start": recent_ts, "sum": 100.0}
         )
+        # yesterday was already re-fetched today -> plain hourly run
 
         with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
             mock_dt.now.return_value = now
@@ -559,3 +562,85 @@ class TestAppendStatisticsFillsQuietHours:
         assert pushed[0]["start"] == day - timedelta(hours=2)
         assert pushed[1]["start"] == day - timedelta(hours=1)
         assert pushed[2]["start"] == day
+
+
+# ---------------------------------------------------------------------------
+# Outage over midnight: yesterday's last hours must not become 0 kWh rows
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertPastStatisticsDateCheck:
+    """`now.day == start.day` also refused the same day of another month."""
+
+    @staticmethod
+    async def _upsert(start):
+        sensor = _make_sensor(new_stats_api=True)
+        sensor.fetch_past_data = AsyncMock(return_value={})
+        now = datetime(2026, 11, 14, 10, 0, 0, tzinfo=TZ_BERLIN)
+        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
+            mock_dt.now.return_value = now
+            await sensor._upsert_past_statistics(
+                start=start, stop=start + timedelta(hours=24)
+            )
+        return sensor
+
+    @pytest.mark.asyncio
+    async def test_same_day_number_in_other_month_is_fetched(self):
+        sensor = await self._upsert(datetime(2026, 10, 14, 0, 0, 0, tzinfo=TZ_BERLIN))
+        sensor.fetch_past_data.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_today_is_still_refused(self):
+        sensor = await self._upsert(datetime(2026, 11, 14, 0, 0, 0, tzinfo=TZ_BERLIN))
+        sensor.fetch_past_data.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# fetch_past_data: a range fetch must not hang forever
+# ---------------------------------------------------------------------------
+
+
+class TestFetchPastDataTimeout:
+    """bosch-thermostat-client 0.28.2 loops forever on an empty day answer."""
+
+    @pytest.mark.asyncio
+    async def test_endless_library_loop_is_cut_off(self):
+        sensor = _make_sensor(new_stats_api=True)
+
+        async def fetch_range(start_time, stop_time):
+            while True:  # `if not data: continue` without advancing the date
+                await asyncio.sleep(0)
+
+        sensor._bosch_object.fetch_range = fetch_range
+        day = datetime(2026, 11, 13, 0, 0, 0, tzinfo=TZ_BERLIN)
+
+        with patch(
+            "custom_components.bosch.sensor.statistic_helper"
+            ".FETCH_RANGE_TIMEOUT_PER_DAY",
+            0.05,
+        ):
+            task = asyncio.ensure_future(
+                sensor.fetch_past_data(
+                    start_time=day, stop_time=day + timedelta(hours=26)
+                )
+            )
+            done, _ = await asyncio.wait({task}, timeout=5)
+        if not done:  # old code: never returns
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert done, "fetch_past_data is still running after 5 s"
+        with pytest.raises(TimeoutError):
+            task.result()
+
+    @pytest.mark.asyncio
+    async def test_answer_in_time_is_passed_through(self):
+        sensor = _make_sensor(new_stats_api=True)
+        day = datetime(2026, 11, 13, 0, 0, 0, tzinfo=TZ_BERLIN)
+        data = {day: {"d": day, "value": 1.0}}
+        sensor._bosch_object.fetch_range = AsyncMock(return_value=data)
+
+        result = await sensor.fetch_past_data(
+            start_time=day, stop_time=day + timedelta(hours=26)
+        )
+
+        assert result is data

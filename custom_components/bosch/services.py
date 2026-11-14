@@ -15,6 +15,7 @@ from homeassistant.core import (
     ServiceResponse,
     SupportsResponse,
 )
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -157,9 +158,29 @@ def async_register_services(hass: HomeAssistant, entry: ConfigEntry) -> None:
             _LOGGER.error("Path or value not defined.")
             return
         data = []
+        failed = []
         for _gateway_entry in _gateway_entries:
             return_value = await _gateway_entry.custom_put(path=_path, value=_value)
             data.append(return_value)
+            if return_value is None:
+                # client library swallowed the error (or got no confirmation)
+                failed.append(_gateway_entry.uuid)
+            elif return_value is not True:
+                # HTTP gateways: the library returns the body without the
+                # status code, so success cannot be told from an error here
+                _LOGGER.warning(
+                    "PUT %s on gateway %s not confirmed, response: %r",
+                    _path,
+                    _gateway_entry.uuid,
+                    return_value,
+                )
+        if failed:
+            _LOGGER.error(
+                "PUT %s failed or was not confirmed by gateway %s.", _path, failed
+            )
+            raise HomeAssistantError(
+                f"PUT {_path} failed or was not confirmed by gateway {failed}"
+            )
         return {
             "data": data
         }

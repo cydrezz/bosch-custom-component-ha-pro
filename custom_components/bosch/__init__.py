@@ -412,14 +412,16 @@ class BoschGatewayEntry:
                 async_dispatcher_send(self.hass, signal)
             return True
 
-    async def custom_put(self, path: str, value: Any) -> None:
+    async def custom_put(self, path: str, value: Any) -> Any:
         """Send PUT directly to gateway without parsing.
 
         Serialized via the update lock so a raw write can never interleave
-        with a running poll cycle on the gateway.
+        with a running poll cycle on the gateway. Returns what the client
+        library returns: True = confirmed by the gateway, None = failed
+        (the library swallows the DeviceException) or not confirmed.
         """
         async with self._update_lock:
-            await self.gateway.raw_put(path=path, value=value)
+            return await self.gateway.raw_put(path=path, value=value)
 
     async def custom_get(self, path) -> str:
         """Fetch value from gateway."""

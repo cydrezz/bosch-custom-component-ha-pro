@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
+from bosch_thermostat_client.exceptions import DeviceException
 from homeassistant.components.recorder.models import (
     StatisticData,
     timestamp_to_datetime_or_none,
@@ -133,6 +134,15 @@ class RecordingSensor(StatisticHelper):
                     # DB query failed - retry next hour instead of
                     # re-importing 30 days with a fresh sum
                     return
+                except (DeviceException, TimeoutError) as err:
+                    # range fetch failed: nothing is written (no 0 kWh rows
+                    # for hours the gateway did not deliver), retry next hour
+                    _LOGGER.warning(
+                        "Gateway delivered no recordings for %s, retry with "
+                        "the next hourly run: %r",
+                        self.statistic_id,
+                        err,
+                    )
         else:
             _LOGGER.debug("Old gather data algorithm.")
             await self.async_old_gather_update()
@@ -142,7 +152,7 @@ class RecordingSensor(StatisticHelper):
     ) -> None:
         now = dt_util.now()
         diff = now - start
-        if now.day == start.day:
+        if now.date() == start.date():
             _LOGGER.warning("Can't upsert today date. Try again tomorrow.")
             return
         if diff > timedelta(days=60):

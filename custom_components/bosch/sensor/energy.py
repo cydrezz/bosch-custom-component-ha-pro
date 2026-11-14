@@ -186,7 +186,7 @@ class EnergySensor(StatisticHelper):
     async def _upsert_past_statistics(self, start: datetime, stop: datetime) -> None:
         now = dt_util.now()
         diff = now - start
-        if now.day == start.day:
+        if now.date() == start.date():
             _LOGGER.warning("Can't upsert today date. Try again tomorrow.")
             return
         if diff > timedelta(days=60):

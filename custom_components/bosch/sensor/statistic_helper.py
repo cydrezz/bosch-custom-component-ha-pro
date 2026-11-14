@@ -40,6 +40,11 @@ _LOGGER = logging.getLogger(__name__)
 # holds none: one month first (cheap), then everything there could be.
 BASELINE_LOOKBACKS = (timedelta(days=30), timedelta(days=3660))
 
+# Seconds per requested day a range fetch may take. bosch-thermostat-client
+# 0.28.2 never leaves fetch_range when the gateway answers a day with an
+# empty body (`if not data: continue` without advancing the date).
+FETCH_RANGE_TIMEOUT_PER_DAY = 20
+
 
 class StatisticsQueryError(Exception):
     """Recorder DB query failed - callers must abort the statistics cycle.
@@ -235,8 +240,12 @@ class StatisticHelper(BoschBaseSensor):
             stop_time,
             self.statistic_id,
         )
-        my_range = await self._bosch_object.fetch_range(
-            start_time=start_time, stop_time=stop_time
+        days = (stop_time.date() - start_time.date()).days + 1
+        my_range = await asyncio.wait_for(
+            self._bosch_object.fetch_range(
+                start_time=start_time, stop_time=stop_time
+            ),
+            timeout=FETCH_RANGE_TIMEOUT_PER_DAY * max(days, 1),
         )
         return my_range
 

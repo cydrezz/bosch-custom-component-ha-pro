@@ -644,3 +644,779 @@ class TestFetchPastDataTimeout:
         )
 
         assert result is data
+
+
+# ---------------------------------------------------------------------------
+# Yesterday is re-fetched after a missed midnight run (0.28.8.9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def berlin_time_zone():
+    """fetch_past_data takes the local midnight from the HA time zone."""
+    from homeassistant.util import dt as ha_dt
+
+    old = ha_dt.DEFAULT_TIME_ZONE
+    ha_dt.set_default_time_zone(TZ_BERLIN)
+    yield
+    ha_dt.set_default_time_zone(old)
+
+
+@pytest.mark.usefixtures("berlin_time_zone")
+class TestCloseYesterdayAfterMissedMidnight:
+    """The library fetches yesterday only in the run right after midnight.
+
+    A missed run left the last hours of yesterday as 0 kWh rows for good.
+    Re-fetching them must never stop the hourly write.
+    """
+
+    DAY = datetime(2026, 11, 14, 0, 0, 0, tzinfo=TZ_BERLIN)
+    YESTERDAY = datetime(2026, 11, 13, 0, 0, 0, tzinfo=TZ_BERLIN)
+
+    @staticmethod
+    def _row(dt, state, _sum):
+        return {"start": dt.timestamp(), "state": state, "sum": _sum}
+
+    @staticmethod
+    def _gw(*rows):
+        """Answer of fetch_range: {date: {"d": date, "value": kWh}}."""
+        return {d: {"d": d, "value": value} for d, value in rows}
+
+    def _sensor(self, db_rows, state):
+        sensor = _make_sensor(new_stats_api=True)
+        sensor._statistic_import_lock = asyncio.Lock()
+        stat_id = sensor.statistic_id
+        sensor.db_rows = db_rows
+
+        async def stats_from_db(start_time, end_time):
+            rows = [
+                r
+                for r in sensor.db_rows
+                if start_time.timestamp() <= r["start"] < end_time.timestamp()
+            ]
+            return {stat_id: rows} if rows else {}
+
+        async def last_stat():
+            return {stat_id: [max(sensor.db_rows, key=lambda r: r["start"])]}
+
+        sensor.get_last_stat = AsyncMock(side_effect=last_stat)
+        sensor.get_stats_from_ha_db = AsyncMock(side_effect=stats_from_db)
+        sensor.add_external_stats = MagicMock()
+        sensor._bosch_object.state = state
+        return sensor
+
+    async def _run(self, sensor, now):
+        """One hourly run; returns the written rows as {start: row}."""
+        sensor.add_external_stats.reset_mock()
+        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.start_of_local_day.side_effect = lambda d=None: (
+                (d or now).replace(hour=0, minute=0, second=0, microsecond=0)
+            )
+            await sensor.async_update()
+        if not sensor.add_external_stats.called:
+            return {}
+        return {
+            row["start"]: row
+            for row in sensor.add_external_stats.call_args.kwargs["stats"]
+        }
+
+    def _down_over_midnight(self):
+        """HA was down from 19:30 until after midnight."""
+        y = self.YESTERDAY
+        db_rows = [
+            self._row(y - timedelta(hours=1), 1.0, 100.0),
+            self._row(y + timedelta(hours=18), 2.0, 102.0),
+            self._row(y + timedelta(hours=19), 1.0, 103.0),  # partial hour
+        ]
+        state = [
+            {"d": self.DAY, "value": 0.5},
+            {"d": self.DAY + timedelta(hours=1), "value": 0.2},
+        ]
+        return self._sensor(db_rows, state)
+
+    def _gateway_yesterday(self):
+        y = self.YESTERDAY
+        return self._gw(
+            # left over in the library from an older call: must be ignored
+            (y - timedelta(hours=3), 9.0),
+            (y + timedelta(hours=18), 2.0),
+            (y + timedelta(hours=19), 1.5),
+            (y + timedelta(hours=21), 3.0),
+            (y + timedelta(hours=23), 1.0),
+            (self.DAY + timedelta(hours=1), 7.0),  # today comes from state
+        )
+
+    @pytest.mark.asyncio
+    async def test_missed_midnight_run_gets_the_late_hours(self):
+        sensor = self._down_over_midnight()
+        sensor._bosch_object.fetch_range = AsyncMock(
+            return_value=self._gateway_yesterday()
+        )
+        y = self.YESTERDAY
+
+        written = await self._run(sensor, self.DAY.replace(hour=1, minute=6))
+
+        # one request, for yesterday only
+        sensor._bosch_object.fetch_range.assert_called_once_with(
+            start_time=y, stop_time=self.DAY
+        )
+        assert sensor._day_closed == self.DAY
+        # old code: 20:00-23:00 of yesterday as 0 kWh, 4.5 kWh lost for good
+        assert written[y + timedelta(hours=19)]["state"] == 1.5
+        assert written[y + timedelta(hours=20)]["state"] == 0
+        assert written[y + timedelta(hours=21)]["state"] == 3.0
+        assert written[y + timedelta(hours=23)]["state"] == 1.0
+        assert written[y + timedelta(hours=23)]["sum"] == pytest.approx(107.5)
+        last = written[self.DAY + timedelta(hours=1)]
+        assert last["state"] == 0.2
+        assert last["sum"] == pytest.approx(108.2)
+        # rebuilt from the row before yesterday, every hour exactly once
+        assert min(written) == y
+        assert len(written) == 26
+
+    @pytest.mark.asyncio
+    async def test_yesterday_is_fetched_only_once_per_day(self):
+        sensor = self._down_over_midnight()
+        sensor._bosch_object.fetch_range = AsyncMock(
+            return_value=self._gateway_yesterday()
+        )
+
+        await self._run(sensor, self.DAY.replace(hour=1, minute=6))
+        written = await self._run(sensor, self.DAY.replace(hour=2, minute=6))
+
+        assert sensor._bosch_object.fetch_range.call_count == 1
+        assert written  # the normal path still writes
+
+    @pytest.mark.asyncio
+    async def test_restart_fetches_again_and_keeps_the_sums(self):
+        """A new object (HA restart) re-fetches; same data -> same sums."""
+        y = self.YESTERDAY
+        db_rows = [
+            self._row(y - timedelta(hours=1), 1.0, 100.0),
+            self._row(y + timedelta(hours=22), 2.0, 102.0),
+            self._row(y + timedelta(hours=23), 1.0, 103.0),
+            self._row(self.DAY + timedelta(hours=14), 0.5, 103.5),
+        ]
+        state = [{"d": self.DAY + timedelta(hours=14), "value": 0.5}]
+        sensor = self._sensor(db_rows, state)
+        sensor._bosch_object.fetch_range = AsyncMock(
+            return_value=self._gw(
+                (y + timedelta(hours=22), 2.0), (y + timedelta(hours=23), 1.0)
+            )
+        )
+
+        written = await self._run(sensor, self.DAY.replace(hour=15, minute=6))
+
+        sensor._bosch_object.fetch_range.assert_called_once()
+        for row in db_rows[1:]:
+            start = datetime.fromtimestamp(row["start"], TZ_BERLIN)
+            assert written[start]["state"] == row["state"]
+            assert written[start]["sum"] == pytest.approx(row["sum"])
+
+    @pytest.mark.asyncio
+    async def test_partial_last_hour_that_ended_at_zero_becomes_zero(self):
+        """Same as the run right after midnight: left out = 0 kWh."""
+        sensor = self._down_over_midnight()
+        y = self.YESTERDAY
+        # 19:00 was written as a partial value (1.0), the gateway leaves it out
+        sensor._bosch_object.fetch_range = AsyncMock(
+            return_value=self._gw(
+                (y + timedelta(hours=18), 2.0), (y + timedelta(hours=23), 1.0)
+            )
+        )
+
+        written = await self._run(sensor, self.DAY.replace(hour=1, minute=6))
+
+        assert written[y + timedelta(hours=18)]["state"] == 2.0
+        assert written[y + timedelta(hours=19)]["state"] == 0
+        assert written[y + timedelta(hours=23)]["sum"] == pytest.approx(103.0)
+
+    @pytest.mark.asyncio
+    async def test_answer_with_less_than_the_recorder_is_not_used(self, caplog):
+        """The re-fetch may add to yesterday, never take away."""
+        sensor = self._down_over_midnight()
+        y = self.YESTERDAY
+        # 18:00 is in the recorder with 2.0 kWh, the gateway leaves it out
+        sensor._bosch_object.fetch_range = AsyncMock(
+            return_value=self._gw((y + timedelta(hours=23), 1.0))
+        )
+
+        with caplog.at_level(logging.WARNING):
+            written = await self._run(
+                sensor, self.DAY.replace(hour=1, minute=6)
+            )
+            again = await self._run(sensor, self.DAY.replace(hour=2, minute=6))
+
+        # normal path: 0 kWh rows after the last row, then today's rows
+        assert min(written) == y + timedelta(hours=20)
+        assert written[y + timedelta(hours=23)]["state"] == 0
+        assert written[self.DAY]["sum"] == pytest.approx(103.5)
+        assert min(again) == y + timedelta(hours=20)
+        assert sensor._day_closed == self.DAY
+        assert sensor._bosch_object.fetch_range.call_count == 1
+        assert "yesterday is left as it is" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_clock_change_day_with_25_entries_falls_back(self, caplog):
+        """The library raises ValueError (hour=24) - the hour is still written."""
+        sensor = self._down_over_midnight()
+        sensor._bosch_object.fetch_range = AsyncMock(
+            side_effect=ValueError("hour must be in 0..23")
+        )
+
+        with caplog.at_level(logging.WARNING):
+            written = await self._run(
+                sensor, self.DAY.replace(hour=1, minute=6)
+            )
+
+        # normal path: today's rows on top of the last row before them
+        assert written[self.DAY]["state"] == 0.5
+        assert written[self.DAY]["sum"] == pytest.approx(103.5)
+        assert sensor._day_closed is None  # next hour tries again
+        assert "Could not re-fetch yesterday" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_empty_day_is_cut_off_and_falls_back(self):
+        """Empty answer = the library never returns; the timeout ends it."""
+        sensor = self._down_over_midnight()
+        calls = []
+
+        async def fetch_range(start_time, stop_time):
+            calls.append(start_time)
+            while True:  # `if not data: continue` without advancing the date
+                await asyncio.sleep(0)
+
+        sensor._bosch_object.fetch_range = fetch_range
+
+        with patch(
+            "custom_components.bosch.sensor.recording.CLOSE_DAY_FETCH_TIMEOUT",
+            0.05,
+        ):
+            task = asyncio.ensure_future(
+                self._run(sensor, self.DAY.replace(hour=1, minute=6))
+            )
+            done, _ = await asyncio.wait({task}, timeout=5)
+        if not done:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert done, "the hourly run is still running after 5 s"
+        written = task.result()
+        assert written[self.DAY]["sum"] == pytest.approx(103.5)
+        # the library floods the gateway until the timeout: once per day only
+        assert sensor._day_closed == self.DAY
+        written = await self._run(sensor, self.DAY.replace(hour=2, minute=6))
+        assert written[self.DAY]["sum"] == pytest.approx(103.5)
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_gives_up_and_keeps_writing(self):
+        """Three failed runs, every one writes; then no more requests."""
+        from bosch_thermostat_client.exceptions import DeviceException
+
+        sensor = self._down_over_midnight()
+        sensor._bosch_object.fetch_range = AsyncMock(
+            side_effect=DeviceException("gateway says no")
+        )
+
+        for hour in (1, 2, 3, 4, 5):
+            written = await self._run(
+                sensor, self.DAY.replace(hour=hour, minute=6)
+            )
+            assert written[self.DAY]["state"] == 0.5, hour
+
+        assert sensor._bosch_object.fetch_range.call_count == 3
+        assert sensor._day_closed == self.DAY
+
+        # the next day starts with a fresh set of attempts
+        next_day = self.DAY + timedelta(days=1)
+        sensor.db_rows.append(
+            self._row(self.DAY + timedelta(hours=5), 0.3, 103.8)
+        )
+        sensor._bosch_object.state = [{"d": next_day, "value": 0.4}]
+        await self._run(sensor, next_day.replace(hour=1, minute=6))
+        assert sensor._bosch_object.fetch_range.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_without_rows_of_today_yesterday_is_left_alone(self):
+        """Rows of today in the recorder but none from the gateway: wait."""
+        y = self.YESTERDAY
+        db_rows = [
+            self._row(y - timedelta(hours=1), 1.0, 100.0),
+            self._row(y + timedelta(hours=23), 1.0, 101.0),
+            self._row(self.DAY + timedelta(hours=9), 0.5, 101.5),
+        ]
+        sensor = self._sensor(db_rows, state=[])
+        sensor._bosch_object.fetch_range = AsyncMock(return_value={})
+
+        written = await self._run(sensor, self.DAY.replace(hour=10, minute=6))
+
+        sensor._bosch_object.fetch_range.assert_not_called()
+        assert written == {}
+        assert sensor._day_closed is None
+
+    @pytest.mark.asyncio
+    async def test_no_row_before_yesterday_skips_the_fetch(self):
+        y = self.YESTERDAY
+        db_rows = [self._row(y + timedelta(hours=23), 1.0, 1.0)]
+        sensor = self._sensor(db_rows, [{"d": self.DAY, "value": 0.5}])
+        sensor._bosch_object.fetch_range = AsyncMock(return_value={})
+
+        written = await self._run(sensor, self.DAY.replace(hour=1, minute=6))
+
+        sensor._bosch_object.fetch_range.assert_not_called()
+        assert sensor._day_closed == self.DAY
+        assert written[self.DAY]["sum"] == pytest.approx(1.5)
+
+    @pytest.mark.asyncio
+    async def test_recorder_failure_aborts_the_run_but_not_for_ever(self):
+        """A failed recorder query still ends the cycle without a write."""
+        from custom_components.bosch.sensor.statistic_helper import (
+            StatisticsQueryError,
+        )
+
+        sensor = self._down_over_midnight()
+        sensor._bosch_object.fetch_range = AsyncMock(
+            return_value=self._gateway_yesterday()
+        )
+        healthy = sensor.get_stats_from_ha_db.side_effect
+
+        async def broken_inside_close(start_time, end_time):
+            if start_time == self.YESTERDAY:  # the query of _close_yesterday
+                raise StatisticsQueryError("db locked")
+            return await healthy(start_time, end_time)
+
+        sensor.get_stats_from_ha_db = AsyncMock(side_effect=broken_inside_close)
+
+        for hour in (1, 2, 3):
+            written = await self._run(
+                sensor, self.DAY.replace(hour=hour, minute=6)
+            )
+            assert written == {}, hour
+        sensor._bosch_object.fetch_range.assert_not_called()
+
+        # after CLOSE_DAY_MAX_ATTEMPTS runs the normal path takes over
+        written = await self._run(sensor, self.DAY.replace(hour=4, minute=6))
+        assert written[self.DAY]["state"] == 0.5
+
+    @pytest.mark.asyncio
+    async def test_row_of_today_behind_the_state_waits(self):
+        """A row of today newer than the state would keep its old sum."""
+        y = self.YESTERDAY
+        db_rows = [
+            self._row(y - timedelta(hours=1), 1.0, 100.0),
+            self._row(y + timedelta(hours=23), 1.0, 101.0),
+            self._row(self.DAY + timedelta(hours=9), 0.5, 101.5),
+            self._row(self.DAY + timedelta(hours=11), 0.1, 101.6),
+        ]
+        state = [{"d": self.DAY + timedelta(hours=9), "value": 0.5}]
+        sensor = self._sensor(db_rows, state)
+        sensor._bosch_object.fetch_range = AsyncMock(return_value={})
+
+        written = await self._run(sensor, self.DAY.replace(hour=12, minute=6))
+
+        sensor._bosch_object.fetch_range.assert_not_called()
+        assert sensor._day_closed is None
+        # the normal path still writes this hour
+        assert written[self.DAY + timedelta(hours=9)]["sum"] == pytest.approx(
+            101.5
+        )
+
+
+class _FakeGateway:
+    """Answers GET like the gateway: 24 (or 25) hourly entries per day."""
+
+    def __init__(self, days):
+        self.days = days  # {"2026-11-13": [kWh per hour, ...]}
+        self.requests = []
+
+    async def get(self, uri):
+        self.requests.append(uri)
+        await asyncio.sleep(0)
+        hours = self.days.get(uri.rsplit("=", 1)[1])
+        if hours is None:
+            return {}
+        return {
+            "interval": uri.rsplit("=", 1)[1],
+            "recording": [
+                {"y": round(kwh * 10), "c": 10 if kwh else 0} for kwh in hours
+            ],
+        }
+
+
+def _library_object(gateway):
+    """A RecordingSensor of bosch-thermostat-client without its __init__."""
+    from bosch_thermostat_client.sensors.recording import (
+        RecordingSensor as LibraryRecordingSensor,
+    )
+
+    lib = object.__new__(LibraryRecordingSensor)
+    lib._lock = asyncio.Lock()
+    lib._past_data = {}
+    lib._connector = gateway
+    lib._data = {"rec": {"uri": "/recordings/x", "result": {}}}
+    lib._main_data = {"id": "rec", "name": "rec"}
+    lib._unit_of_measurement = "kWh"
+    return lib
+
+
+def _hours(**values):
+    """24 hourly kWh values, e.g. _hours(h20=1.5) -> 20:00 has 1.5 kWh."""
+    day = [0.0] * 24
+    for key, value in values.items():
+        day[int(key[1:])] = value
+    return day
+
+
+@pytest.mark.usefixtures("berlin_time_zone")
+class TestCloseYesterdayWithTheRealLibrary:
+    """Same runs against fetch_range and update of bosch-thermostat-client."""
+
+    @staticmethod
+    def _row(dt, state, _sum):
+        return {"start": dt.timestamp(), "state": state, "sum": _sum}
+
+    def _sensor(self, db_rows, gateway):
+        sensor = _make_sensor(new_stats_api=True)
+        sensor._statistic_import_lock = asyncio.Lock()
+        sensor._bosch_object = _library_object(gateway)
+        stat_id = sensor.statistic_id
+        sensor.db_rows = db_rows
+
+        async def stats_from_db(start_time, end_time):
+            rows = [
+                r
+                for r in sensor.db_rows
+                if start_time.timestamp() <= r["start"] < end_time.timestamp()
+            ]
+            return {stat_id: rows} if rows else {}
+
+        async def last_stat():
+            return {stat_id: [max(sensor.db_rows, key=lambda r: r["start"])]}
+
+        sensor.get_last_stat = AsyncMock(side_effect=last_stat)
+        sensor.get_stats_from_ha_db = AsyncMock(side_effect=stats_from_db)
+        sensor.add_external_stats = MagicMock()
+        return sensor
+
+    async def _run(self, sensor, now, day_closed=False):
+        """Hourly run like __init__.py: library update, then the sensor.
+
+        Returns the written rows as {start as timestamp: (state, sum)}.
+        """
+        if day_closed:  # forces the path without the re-fetch (old code)
+            sensor._day_closed = now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        await sensor._bosch_object.update(time=now)
+        sensor.add_external_stats.reset_mock()
+        with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.start_of_local_day.side_effect = lambda d=None: (
+                (d or now).replace(hour=0, minute=0, second=0, microsecond=0)
+            )
+            await sensor.async_update()
+        if not sensor.add_external_stats.called:
+            return {}
+        return {
+            row["start"].timestamp(): (row["state"], round(row["sum"], 3))
+            for row in sensor.add_external_stats.call_args.kwargs["stats"]
+        }
+
+    @pytest.mark.asyncio
+    async def test_stale_library_value_inside_yesterday_is_dropped(self):
+        """14:00 was fetched with 0.4 kWh once and ended at 0 kWh."""
+        day = datetime(2026, 11, 14, tzinfo=TZ_BERLIN)
+        y = datetime(2026, 11, 13, tzinfo=TZ_BERLIN)
+        gateway = _FakeGateway(
+            {
+                "2026-11-13": _hours(h20=2.0),
+                "2026-11-14": _hours(h0=0.5),
+            }
+        )
+        sensor = self._sensor(
+            [
+                self._row(y - timedelta(hours=1), 1.0, 100.0),
+                self._row(y + timedelta(hours=14), 0.4, 100.4),
+            ],
+            gateway,
+        )
+        stale = y + timedelta(hours=14)
+        sensor._bosch_object._past_data[stale] = {"d": stale, "value": 0.4}
+
+        written = await self._run(sensor, day.replace(hour=1, minute=6))
+
+        assert written[stale.timestamp()] == (0, 100.0)
+        assert written[(y + timedelta(hours=20)).timestamp()] == (2.0, 102.0)
+        assert written[day.timestamp()] == (0.5, 102.5)
+
+    @pytest.mark.parametrize(
+        ("today", "yesterday_hours"),
+        [
+            # plain day; 14:00 had a partial value that ended at 0 kWh
+            ((2026, 11, 14), _hours(h13=1.0, h20=2.0, h23=0.7)),
+            # day of the spring clock change, the gateway numbers 0..23
+            ((2026, 3, 30), _hours(h1=0.3, h2=0.7, h3=0.4, h23=1.1)),
+            ((2026, 3, 30), _hours(h1=0.3, h2=0.7)),
+            # day after the autumn clock change with 24 entries
+            ((2026, 10, 26), _hours(h2=0.6, h3=0.2, h22=1.0)),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_first_run_writes_what_the_midnight_run_writes(
+        self, today, yesterday_hours
+    ):
+        """Re-fetch at 00:06 and at 01:06 == the old run right after midnight."""
+        day = datetime(*today, tzinfo=TZ_BERLIN)
+        y = day - timedelta(days=1)
+        key = y.strftime("%Y-%m-%d")
+        at_13 = yesterday_hours[13]  # HA went down at 14:30
+
+        def sensor():
+            gateway = _FakeGateway(
+                {key: yesterday_hours, day.strftime("%Y-%m-%d"): _hours()}
+            )
+            return self._sensor(
+                [
+                    self._row(y - timedelta(hours=1), 1.0, 100.0),
+                    self._row(y + timedelta(hours=13), at_13, 100.0 + at_13),
+                    self._row(y + timedelta(hours=14), 0.3, 100.3 + at_13),
+                ],
+                gateway,
+            )
+
+        old = await self._run(
+            sensor(), day.replace(minute=6), day_closed=True
+        )
+        at_midnight = sensor()
+        new = await self._run(at_midnight, day.replace(minute=6))
+        an_hour_later = sensor()
+        late = await self._run(an_hour_later, day.replace(hour=1, minute=6))
+
+        assert old, "the old path wrote nothing, the comparison is empty"
+        assert new == old
+        assert late == old
+        assert at_midnight._day_closed == day
+        assert an_hour_later._day_closed == day
+        # the re-fetch asked for yesterday, exactly once
+        assert an_hour_later._bosch_object._connector.requests.count(
+            f"/recordings/x?interval={key}"
+        ) == 1
+
+    @pytest.mark.asyncio
+    async def test_autumn_clock_change_day_with_25_entries(self):
+        """Real library: ValueError for hour=24, the hour is still written."""
+        day = datetime(2026, 10, 26, tzinfo=TZ_BERLIN)
+        y = datetime(2026, 10, 25, tzinfo=TZ_BERLIN)
+        gateway = _FakeGateway(
+            {
+                "2026-10-25": _hours(h20=2.0) + [1.0],
+                "2026-10-26": _hours(h0=0.5),
+            }
+        )
+        sensor = self._sensor(
+            [
+                self._row(y - timedelta(hours=1), 1.0, 100.0),
+                self._row(y + timedelta(hours=14), 0.4, 100.4),
+            ],
+            gateway,
+        )
+
+        for hour in (1, 2, 3, 4):
+            written = await self._run(sensor, day.replace(hour=hour, minute=6))
+            assert written[day.timestamp()] == (0.5, 100.9), hour
+
+        assert sensor._day_closed == day
+        assert gateway.requests.count("/recordings/x?interval=2026-10-25") == 3
+
+    @pytest.mark.asyncio
+    async def test_empty_answer_is_asked_once_per_day(self):
+        """Real library: empty answer = request loop until the timeout."""
+        day = datetime(2026, 11, 14, tzinfo=TZ_BERLIN)
+        y = datetime(2026, 11, 13, tzinfo=TZ_BERLIN)
+        gateway = _FakeGateway({"2026-11-14": _hours(h0=0.5)})
+        sensor = self._sensor(
+            [
+                self._row(y - timedelta(hours=1), 1.0, 100.0),
+                self._row(y + timedelta(hours=14), 0.4, 100.4),
+            ],
+            gateway,
+        )
+
+        with patch(
+            "custom_components.bosch.sensor.recording.CLOSE_DAY_FETCH_TIMEOUT",
+            0.05,
+        ):
+            written = await asyncio.wait_for(
+                self._run(sensor, day.replace(hour=1, minute=6)), 5
+            )
+            flood = len(gateway.requests)
+            again = await asyncio.wait_for(
+                self._run(sensor, day.replace(hour=2, minute=6)), 5
+            )
+
+        assert written[day.timestamp()] == (0.5, 100.9)
+        assert again[day.timestamp()] == (0.5, 100.9)
+        assert sensor._day_closed == day
+        assert flood > 2
+        assert len(gateway.requests) == flood + 1  # only the normal update
+
+    def _complete_yesterday(self, y, day):
+        """Recorder as the midnight run left it, plus today 00:00-09:00."""
+        rows = [self._row(y - timedelta(hours=1), 1.0, 100.0)]
+        total = 100.0
+        for hour in range(24):
+            total += 1.0
+            rows.append(self._row(y + timedelta(hours=hour), 1.0, total))
+        for hour in range(10):
+            total += 0.5
+            rows.append(self._row(day + timedelta(hours=hour), 0.5, total))
+        return rows
+
+    @pytest.mark.parametrize(
+        "gateway_yesterday",
+        [
+            [0.0] * 24,  # the gateway lost its history
+            [0.5] * 10 + [0.0] * 14,  # it answers with the rows of today
+            [3.0] * 12 + [0.0] * 12,  # another day with more in total
+            [1.0] * 12 + [0.9] + [1.0] * 11,  # one hour came back smaller
+            None,  # answer without recordings
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_restart_keeps_a_complete_yesterday(self, gateway_yesterday):
+        """Restart at 10:30, the gateway reports less than the recorder has."""
+        day = datetime(2026, 11, 14, tzinfo=TZ_BERLIN)
+        y = datetime(2026, 11, 13, tzinfo=TZ_BERLIN)
+        gateway = _FakeGateway({"2026-11-14": [0.5] * 10 + [0.0] * 14})
+        if gateway_yesterday is None:
+            real_get = gateway.get
+
+            async def get(uri):
+                if uri.endswith("2026-11-13"):
+                    gateway.requests.append(uri)
+                    return {"interval": "2026-11-13"}
+                return await real_get(uri)
+
+            gateway.get = get
+        else:
+            gateway.days["2026-11-13"] = gateway_yesterday
+        sensor = self._sensor(self._complete_yesterday(y, day), gateway)
+
+        written = await self._run(sensor, day.replace(hour=10, minute=30))
+        again = await self._run(sensor, day.replace(hour=11, minute=6))
+
+        # 24 kWh of yesterday stay, nothing of yesterday is rewritten
+        assert min(written) == day.timestamp()
+        assert written[(day + timedelta(hours=9)).timestamp()] == (0.5, 129.0)
+        assert again[(day + timedelta(hours=9)).timestamp()] == (0.5, 129.0)
+        assert sensor._day_closed == day
+        assert gateway.requests.count("/recordings/x?interval=2026-11-13") == 1
+
+    @pytest.mark.asyncio
+    async def test_restart_with_a_complete_yesterday_changes_nothing(self):
+        """Same answer as the recorder has: same rows, same sums."""
+        day = datetime(2026, 11, 14, tzinfo=TZ_BERLIN)
+        y = datetime(2026, 11, 13, tzinfo=TZ_BERLIN)
+        gateway = _FakeGateway(
+            {
+                "2026-11-13": [1.0] * 24,
+                "2026-11-14": [0.5] * 10 + [0.0] * 14,
+            }
+        )
+        db_rows = self._complete_yesterday(y, day)
+        sensor = self._sensor(db_rows, gateway)
+
+        written = await self._run(sensor, day.replace(hour=10, minute=30))
+
+        assert min(written) == y.timestamp()  # yesterday was rebuilt
+        for row in db_rows[1:]:
+            assert written[row["start"]] == (row["state"], row["sum"])
+
+    @pytest.mark.asyncio
+    async def test_failed_first_run_does_not_block_the_second(self):
+        """The 0 kWh rows of the normal path must not hide the partial hour."""
+        from bosch_thermostat_client.exceptions import DeviceException
+
+        day = datetime(2026, 11, 14, tzinfo=TZ_BERLIN)
+        y = datetime(2026, 11, 13, tzinfo=TZ_BERLIN)
+        gateway = _FakeGateway(
+            {
+                "2026-11-13": _hours(h20=1.0, h21=0.5, h22=1.2, h23=1.3),
+                "2026-11-14": [0.5] * 10 + [0.0] * 14,
+            }
+        )
+        real_get = gateway.get
+        failures = [DeviceException("gateway hiccup")]
+
+        async def get(uri):
+            if uri.endswith("2026-11-13") and failures:
+                raise failures.pop()
+            return await real_get(uri)
+
+        gateway.get = get
+        # HA was down from 21:30 until 08:00; 21:00 is a partial value
+        sensor = self._sensor(
+            [
+                self._row(y - timedelta(hours=1), 1.0, 100.0),
+                self._row(y + timedelta(hours=20), 1.0, 101.0),
+                self._row(y + timedelta(hours=21), 0.8, 101.8),
+            ],
+            gateway,
+        )
+
+        first = await self._run(sensor, day.replace(hour=8, minute=6))
+        # the normal path wrote 22:00 and 23:00 as 0 kWh rows
+        assert first[(y + timedelta(hours=23)).timestamp()] == (0, 101.8)
+        rows = {row["start"]: row for row in sensor.db_rows}
+        for start, (state, total) in first.items():
+            rows[start] = {"start": start, "state": state, "sum": total}
+        sensor.db_rows = sorted(rows.values(), key=lambda row: row["start"])
+        second = await self._run(sensor, day.replace(hour=9, minute=6))
+
+        assert second[(y + timedelta(hours=21)).timestamp()] == (0.5, 101.5)
+        assert second[(y + timedelta(hours=22)).timestamp()] == (1.2, 102.7)
+        assert second[(y + timedelta(hours=23)).timestamp()] == (1.3, 104.0)
+        assert second[day.timestamp()] == (0.5, 104.5)
+        assert sensor._day_closed == day
+
+    @pytest.mark.asyncio
+    async def test_zeros_do_not_replace_the_only_row_with_a_value(self):
+        """Quiet day: all of yesterday is in its newest row."""
+        day = datetime(2026, 11, 14, tzinfo=TZ_BERLIN)
+        y = datetime(2026, 11, 13, tzinfo=TZ_BERLIN)
+        gateway = _FakeGateway(
+            {"2026-11-13": [0.0] * 24, "2026-11-14": _hours(h6=0.5)}
+        )
+        db_rows = [self._row(y - timedelta(hours=1), 1.0, 100.0)]
+        db_rows += [
+            self._row(y + timedelta(hours=hour), 0.0, 100.0)
+            for hour in range(13)
+        ]
+        db_rows.append(self._row(y + timedelta(hours=13), 1.5, 101.5))
+        sensor = self._sensor(db_rows, gateway)
+
+        written = await self._run(sensor, day.replace(hour=10, minute=30))
+
+        assert (y + timedelta(hours=13)).timestamp() not in written
+        assert written[(day + timedelta(hours=6)).timestamp()] == (0.5, 102.0)
+        assert sensor._day_closed == day
+
+    @pytest.mark.asyncio
+    async def test_restart_adds_what_the_gateway_has_on_top(self):
+        """Hours that grew or came new are taken, 23:00 may shrink."""
+        day = datetime(2026, 11, 14, tzinfo=TZ_BERLIN)
+        y = datetime(2026, 11, 13, tzinfo=TZ_BERLIN)
+        gateway = _FakeGateway(
+            {
+                "2026-11-13": [1.0] * 5 + [1.5] + [1.0] * 17 + [0.4],
+                "2026-11-14": [0.5] * 10 + [0.0] * 14,
+            }
+        )
+        sensor = self._sensor(self._complete_yesterday(y, day), gateway)
+
+        written = await self._run(sensor, day.replace(hour=10, minute=30))
+
+        assert written[(y + timedelta(hours=5)).timestamp()] == (1.5, 106.5)
+        assert written[(y + timedelta(hours=23)).timestamp()] == (0.4, 123.9)
+        assert written[(day + timedelta(hours=9)).timestamp()] == (0.5, 128.9)

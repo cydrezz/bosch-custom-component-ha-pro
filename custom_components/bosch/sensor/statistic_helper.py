@@ -230,9 +230,21 @@ class StatisticHelper(BoschBaseSensor):
                 return
 
     async def fetch_past_data(
-        self, start_time: datetime, stop_time: datetime
+        self,
+        start_time: datetime,
+        stop_time: datetime,
+        timeout: float | None = None,
     ) -> dict:
-        """Rename old entity_id in statistic table."""
+        """Fetch hourly rows from the gateway, cut off after a timeout.
+
+        timeout overrides the default of FETCH_RANGE_TIMEOUT_PER_DAY per
+        requested day.
+
+        The library keeps every row it ever fetched and skips 0 kWh hours.
+        An hour fetched earlier with a partial value that ended at 0 kWh
+        would come back with the old value. So what the library holds for
+        the requested range is dropped first; the answer replaces it.
+        """
         start_time = dt_util.start_of_local_day(start_time)
         _LOGGER.debug(
             "Attempt to fetch range %s - %s for %s",
@@ -240,12 +252,18 @@ class StatisticHelper(BoschBaseSensor):
             stop_time,
             self.statistic_id,
         )
-        days = (stop_time.date() - start_time.date()).days + 1
+        past_data = getattr(self._bosch_object, "_past_data", None)
+        if isinstance(past_data, dict):
+            for key in [k for k in past_data if start_time <= k <= stop_time]:
+                del past_data[key]
+        if timeout is None:
+            days = (stop_time.date() - start_time.date()).days + 1
+            timeout = FETCH_RANGE_TIMEOUT_PER_DAY * max(days, 1)
         my_range = await asyncio.wait_for(
             self._bosch_object.fetch_range(
                 start_time=start_time, stop_time=stop_time
             ),
-            timeout=FETCH_RANGE_TIMEOUT_PER_DAY * max(days, 1),
+            timeout=timeout,
         )
         return my_range
 

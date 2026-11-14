@@ -17,12 +17,24 @@ from .statistic_helper import StatisticHelper, StatisticsQueryError
 
 _LOGGER = logging.getLogger(__name__)
 
+# Re-fetching yesterday (see _close_yesterday) is tried in this many hourly
+# runs per day, then the day is left as it is.
+CLOSE_DAY_MAX_ATTEMPTS = 3
+# Seconds the single request for yesterday may take.
+CLOSE_DAY_FETCH_TIMEOUT = 20
+# kWh an hour of yesterday may come back smaller than the recorder has it
+CLOSE_DAY_TOLERANCE = 0.05
+
 
 class RecordingSensor(StatisticHelper):
     """Representation of Recording Sensor."""
 
     signal = SIGNAL_RECORDING_UPDATE_BOSCH
     _domain_name = "Recording"
+    # local midnight of the day on which yesterday was re-fetched (or given up)
+    _day_closed = None
+    # (local midnight, number of runs that tried to re-fetch yesterday)
+    _close_day_attempts = (None, 0)
 
     @property
     def device_name(self) -> str:
@@ -276,6 +288,151 @@ class RecordingSensor(StatisticHelper):
         self._last_reset = now
         return sum
 
+    async def _close_yesterday(
+        self, last_stats: dict, start_of_day: datetime, now: datetime
+    ) -> tuple[list, float, datetime] | None:
+        """Re-fetch yesterday once per day and rebuild from the row before it.
+
+        The client library fetches the previous day only in the run right
+        after midnight. If that run is missed (gateway or HA down), the last
+        hours of yesterday never arrive and append_statistics fills them with
+        0 kWh for good. So the first run of a day, and the first run after a
+        restart, asks the gateway for yesterday itself.
+
+        The result is what the run right after midnight would have written:
+        yesterday as the gateway reports it now (an hour it leaves out is a
+        0 kWh hour, the library cannot tell the two apart), today from the
+        normal state.
+
+        The re-fetch may add to yesterday, never take away: fetch_range does
+        not check which day the gateway answered with, and a gateway that
+        lost its history answers with zeros. If the answer has less for an
+        hour than the recorder already holds, yesterday is left as it is.
+        Only the newest row of yesterday with a value may shrink: it can be
+        the partial value of an hour that was still running when the hourly
+        runs stopped. An answer without any row for yesterday replaces
+        nothing.
+
+        Returns (rows, sum, baseline start) for append_statistics, or None:
+        then the caller writes this hour the normal way. Nothing in here may
+        stop the hourly write. Every error except a failed recorder query
+        ends in None, and after CLOSE_DAY_MAX_ATTEMPTS runs, or after one
+        timeout, the day is left as it is.
+        """
+        if self._close_day_attempts[0] != start_of_day:
+            self._close_day_attempts = (start_of_day, 0)
+        attempt = self._close_day_attempts[1] + 1
+        self._close_day_attempts = (start_of_day, attempt)
+        if attempt >= CLOSE_DAY_MAX_ATTEMPTS:
+            # set before anything can fail: there is no further attempt today
+            self._day_closed = start_of_day
+        try:
+            yesterday = start_of_day - timedelta(days=1)
+            baseline = await self.async_get_last_stats_before_date(
+                last_stats=last_stats, day=yesterday
+            )
+            if not baseline:
+                # no row before yesterday, nothing to rebuild from
+                self._day_closed = start_of_day
+                return None
+            base_start = baseline.get("start")
+            if isinstance(base_start, float):
+                base_start = timestamp_to_datetime_or_none(base_start)
+            state = self._bosch_object.state
+            today = [
+                row
+                for row in (state if isinstance(state, list) else [])
+                if row["d"] >= start_of_day
+            ]
+            covered_until = max(
+                (row["d"].timestamp() for row in today),
+                default=start_of_day.timestamp() - 1,
+            )
+            recorded = (
+                await self.get_stats_from_ha_db(
+                    start_time=yesterday, end_time=now
+                )
+            ).get(self.statistic_id, [])
+            day_ts = start_of_day.timestamp()
+            if any(stat["start"] > covered_until for stat in recorded):
+                # a row of today behind the newest state row would keep its
+                # old sum after yesterday changed; wait for a later run
+                _LOGGER.debug(
+                    "Rows of today for %s are newer than the gateway state, "
+                    "yesterday is not re-fetched in this run.",
+                    self.statistic_id,
+                )
+                return None
+            bosch_data = await self.fetch_past_data(
+                start_time=yesterday,
+                stop_time=start_of_day,
+                timeout=CLOSE_DAY_FETCH_TIMEOUT,
+            )
+            rows = [
+                row
+                for row in list(bosch_data.values())
+                if yesterday <= row["d"] < start_of_day
+            ]
+            fetched: dict[float, float] = {}
+            for row in rows:
+                hour = row["d"].timestamp()
+                fetched[hour] = max(fetched.get(hour, 0), row[VALUE])
+            # rows with a value only: the normal path may have written
+            # 0 kWh rows behind the partial hour in an earlier run
+            had = sorted(
+                (stat["start"], stat.get("state") or 0)
+                for stat in recorded
+                if stat["start"] < day_ts and (stat.get("state") or 0) > 0
+            )
+            lost = [
+                (hour, value)
+                for hour, value in (had[:-1] if rows else had)
+                if fetched.get(hour, 0) < value - CLOSE_DAY_TOLERANCE
+            ]
+            if lost:
+                self._day_closed = start_of_day
+                hour, value = lost[0]
+                _LOGGER.warning(
+                    "Gateway reports less for yesterday of %s than the "
+                    "recorder holds (%s hours, first %s: %s < %s), "
+                    "yesterday is left as it is.",
+                    self.statistic_id,
+                    len(lost),
+                    timestamp_to_datetime_or_none(hour),
+                    fetched.get(hour, 0),
+                    value,
+                )
+                return None
+            rows.extend(today)
+        except StatisticsQueryError:
+            raise
+        except TimeoutError as err:
+            # On an empty answer the library repeats the request without a
+            # pause until the timeout. Not a second time today.
+            self._day_closed = start_of_day
+            _LOGGER.warning(
+                "No answer for yesterday of %s within %s s, the day is left "
+                "as it is and this hour is written the normal way: %r",
+                self.statistic_id,
+                CLOSE_DAY_FETCH_TIMEOUT,
+                err,
+            )
+            return None
+        except Exception as err:  # noqa: BLE001
+            # deliberately broad: the client library raises ValueError for a
+            # day with 25 entries. Nothing here may stop the hourly write.
+            _LOGGER.warning(
+                "Could not re-fetch yesterday for %s (run %s of %s), this "
+                "hour is written the normal way: %r",
+                self.statistic_id,
+                attempt,
+                CLOSE_DAY_MAX_ATTEMPTS,
+                err,
+            )
+            return None
+        self._day_closed = start_of_day
+        return rows, baseline.get("sum", 0), base_start
+
     async def _insert_statistics(self) -> None:
         """Insert external statistics."""
         _sum = 0
@@ -352,6 +509,8 @@ class RecordingSensor(StatisticHelper):
                 bosch_data = await self.fetch_past_data(
                     start_time=start_time, stop_time=now
                 )
+                # this fetch covered yesterday as well
+                self._day_closed = start_of_day
                 return (
                     [
                         row
@@ -361,6 +520,12 @@ class RecordingSensor(StatisticHelper):
                     _sum,
                     start_time,
                 )
+            elif self._day_closed != start_of_day:
+                closed = await self._close_yesterday(
+                    last_stats, start_of_day, now
+                )
+                if closed is not None:
+                    return closed
             _LOGGER.debug(
                 "Returning state to put to statistic table %s",
                 self._bosch_object.state,

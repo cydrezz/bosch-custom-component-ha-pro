@@ -264,7 +264,7 @@ class TestInsertStatisticsElseBranch:
         sensor.get_last_stats_before_date = MagicMock(
             return_value={"start": recent_ts, "sum": 100.0}
         )
-        # yesterday was already re-fetched today -> plain hourly run
+        # statistics are up to date -> plain hourly run
 
         with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
             mock_dt.now.return_value = now
@@ -305,7 +305,7 @@ class TestInsertStatisticsElseBranch:
         sensor.get_last_stats_before_date = MagicMock(
             return_value={"start": recent_ts, "sum": 100.0}
         )
-        # yesterday was already re-fetched today -> plain hourly run
+        # statistics are up to date -> plain hourly run
 
         with patch("custom_components.bosch.sensor.recording.dt_util") as mock_dt:
             mock_dt.now.return_value = now
@@ -565,7 +565,7 @@ class TestAppendStatisticsFillsQuietHours:
 
 
 # ---------------------------------------------------------------------------
-# Outage over midnight: yesterday's last hours must not become 0 kWh rows
+# _upsert_past_statistics: compare the full date, not the day of month
 # ---------------------------------------------------------------------------
 
 
